@@ -1,16 +1,13 @@
 #@ File (label="Directory", style="directory") srcDir
 #@ String (label="Position", ) position
-#@ String (label="Round1", ) round1
-#@ String (label="Round2", ) round2
-#@ String (label="Round3", ) round3
-#@ String (label="Round4", ) round4
+#@ Integer (label="Number of rounds", value=4) num_rounds
 #@ String (label="Red channel", ) channel1
 #@ String (label="Green channel", ) channel2
-#@ String (label="Blue channel", ) channel3
-#@ String (label="Cyan channel", ) channel4
-#@ String (label="Magenta channel", ) channel5
+#@ String (label="Cyan channel", ) channel3
+#@ String (label="Magenta channel", ) channel4
 #@ Integer (label="Y min (first row)", value=1) ymin
 #@ Integer (label="Y max (last row)", value=1) ymax
+#@ Boolean (label="Threshold images", value=0) do_thresh
 
 from ij import IJ, ImagePlus, ImageStack
 from ij.gui import GenericDialog
@@ -21,10 +18,59 @@ import os, math
 # Set only the foreground color
 IJ.setForegroundColor(255, 255, 255)  # white in RGB
 
-def run(srcDir, position, rounds, channels,ylims):
+def reorder_for_column_first(stack, n_cols, n_rows):
+    """
+    Reorders stack slices from row-first to column-first order.
+    E.g. for 2 cols x 4 rows:
+      Input order:  1,2,3,4,5,6,7,8  (row-first)
+      Output order: 1,3,5,7,2,4,6,8  (column-first)
+    """
+    new_stack = ImageStack(stack.getWidth(), stack.getHeight())
+    for row in range(n_rows):
+    	for col in range(n_cols):
+    		index = col*n_rows + row+1
+    		new_stack.addSlice(stack.getSliceLabel(index), stack.getProcessor(index))
+    return new_stack
+
+def get_montage_size(stack):
+	N = len(stack)
+	n_cols = (N-1) // 4 +1
+	n_rows = int(math.ceil(N/n_cols))
+	return n_cols, n_rows
+	
+def flatfield_correction(imp, sigma=50.0):
+	"""
+	Pseudo-flat-field correction using Gaussian blur estimate.
+	sigma: blur radius — should be larger than your largest feature of interest.
+	       Typically 50-100 pixels for a 1024x1024 image.
+	"""
+	ip = imp.getProcessor().convertToFloat()
+	
+	# Estimate illumination: heavily blurred version of the image
+	flat = ip.duplicate()
+	flat.blurGaussian(sigma)
+	
+	# Compute mean of the flat field for rescaling
+	flat_pixels = flat.getPixels()
+	mean_flat = sum(flat_pixels) / len(flat_pixels)
+	
+	# Divide original by flat field, rescale by mean
+	src  = ip.getPixels()
+	corr = flat.getPixels()
+	corrected_pixels = [
+	    (src[i] / corr[i]) * mean_flat if corr[i] != 0 else 0
+	    for i in range(len(src))
+	]
+	
+	result = FloatProcessor(imp.getWidth(), imp.getHeight(), corrected_pixels, None)
+	result.setMinAndMax(0, result.getMax())
+	result = result.convertToShort(True) # True = scale to full 16-bit range
+	return ImagePlus(imp.getTitle() + "_corrected", result)
+
+def run(srcDir, position, rounds, channels, ylims, do_thresh):
    
 	composites = []  # Collect labelled composites for montage
-	merge_channels = ["c1","c2","c3","c5","c6"]
+	merge_channels = ["c1","c2","c5","c6"]
 	
 	for r in rounds:
 		posfolder = os.path.join(srcDir, r, position)
@@ -52,7 +98,16 @@ def run(srcDir, position, rounds, channels,ylims):
 				if ylims is not None:
 					imp.setRoi(0, ylims[0], imp.getWidth(), ylims[1] - ylims[0])
 					imp = imp.crop()
-				#imp.flatten()
+				
+				# Threshold images if requested
+				if do_thresh:
+					#imp = flatfield_correction(imp, sigma=5.0)
+					IJ.run(imp, "Auto Threshold", "method=Triangle white")
+					IJ.run(imp, "Analyze Particles...", "size=10-Infinity show=Masks include")
+					imp.close()
+					imp = IJ.getImage()
+					#IJ.run(imp, "Invert", "")
+					
 				imp.setTitle(r + "_" + c)
 				imp.show()
 				IJ.run(imp, "Enhance Contrast", "saturated=0.35 normalize")
@@ -89,21 +144,24 @@ def run(srcDir, position, rounds, channels,ylims):
 	if len(composites)>1:
 		# Stack all rounds and make a 1-column x 4-row montage
 		IJ.run("Images to Stack", "name=MontageStack title=R use")
-		IJ.run("Make Montage...", "columns=1 rows="+str(len(rounds))+" scale=1 border=2 use")
+		
+		# Reorder slices for column-first layout
+		stack_imp = IJ.getImage()
+		n_cols,n_rows=get_montage_size(composites)
+		reordered = reorder_for_column_first(stack_imp.getStack(), n_cols, n_rows)
+		stack_imp.setStack(reordered)
+		
+		IJ.run("Make Montage...", "columns="+str(n_cols)+" rows="+str(n_rows)+" scale=1 border=2 use")
 		montage = IJ.getImage()
 		montage.setTitle("Genotyping_" + position)
 		
 		# Close the intermediate stack
-		IJ.selectWindow("MontageStack")
-		IJ.run("Close")
+		stack_imp.close()
 
 
 # Main function
-rounds = []
-for r in [round1, round2, round3, round4]:
-	if r !="":
-		rounds.append(r)
-channels = [channel1, channel2, channel3, channel4, channel5]
+rounds = ["R"+str(i+1) for i in range(num_rounds)]
+channels = [channel1, channel2, channel3, channel4]
 ymax = max(ymin,ymax)
 ylims = [ymin, ymax]
 if ymin==ymax:
@@ -111,4 +169,4 @@ if ymin==ymax:
 else:
 	ylims = [max(0,y-1) for y in ylims]
 		
-run(srcDir.getPath(), position, rounds, channels, ylims)
+run(srcDir.getPath(), position, rounds, channels, ylims, do_thresh)
